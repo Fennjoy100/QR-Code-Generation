@@ -1,0 +1,6 @@
+{
+  "name": "QuickQR",
+  "description": "Convert your text into a scannable QR code in seconds. Simple, fast, and high-resolution PNG & SVG exports.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
