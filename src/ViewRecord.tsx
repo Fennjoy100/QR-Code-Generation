@@ -27,77 +27,90 @@ export default function ViewRecord() {
     let isMounted = true;
 
     async function fetchRecord() {
-      if (!id) {
-        setError('No QR record identifier provided.');
-        setLoading(false);
+      if (!id || typeof id !== 'string' || !id.trim()) {
+        if (isMounted) {
+          setError('No QR record identifier provided.');
+          setLoading(false);
+        }
         return;
       }
 
+      const cleanId = id.trim();
       setLoading(true);
       setError(null);
 
-      try {
-        const response = await fetch(`/api/records/${encodeURIComponent(id)}`);
-        if (!response.ok) {
-          if (response.status === 404) {
-            // Check localStorage as backup in case of client-only session
-            const localHistory = localStorage.getItem('quickqr_history');
-            if (localHistory) {
-              try {
-                const parsed = JSON.parse(localHistory);
-                const found = parsed.find((item: { id: string }) => item.id === id);
-                if (found && isMounted) {
-                  setRecord({
-                    id: found.id,
-                    text: found.text,
-                    createdAt: found.createdAt,
-                    views: 1,
-                  });
-                  setLoading(false);
-                  return;
-                }
-              } catch (e) {
-                console.error(e);
-              }
-            }
-            throw new Error('This QR code record does not exist or has expired.');
-          }
-          throw new Error(`Failed to load record (${response.status})`);
-        }
-
-        const data: QrRecord = await response.json();
-        if (isMounted) {
-          setRecord(data);
-        }
-      } catch (err: unknown) {
-        if (isMounted) {
-          // Final fallback to localStorage check
+      // Helper to check localStorage backup
+      const checkLocalBackup = (): QrRecord | null => {
+        try {
           const localHistory = localStorage.getItem('quickqr_history');
           if (localHistory) {
-            try {
-              const parsed = JSON.parse(localHistory);
-              const found = parsed.find((item: { id: string }) => item.id === id);
-              if (found) {
-                setRecord({
+            const parsed = JSON.parse(localHistory);
+            if (Array.isArray(parsed)) {
+              const found = parsed.find((item: { id: string }) => item.id === cleanId);
+              if (found && found.text) {
+                return {
                   id: found.id,
                   text: found.text,
-                  createdAt: found.createdAt,
+                  createdAt: found.createdAt || new Date().toISOString(),
                   views: 1,
-                });
-                setLoading(false);
-                return;
+                };
               }
-            } catch {
-              // ignore
             }
           }
-          setError(
-            err instanceof Error
-              ? err.message
-              : 'Unable to load QR record. Please check the link or internet connection.'
-          );
+        } catch {
+          // Ignore localStorage parsing issues
         }
-      } finally {
+        return null;
+      };
+
+      try {
+        const response = await fetch(`/api/records/${encodeURIComponent(cleanId)}`);
+        const contentType = response.headers.get('content-type') || '';
+
+        // Safe JSON parsing: Never call .json() directly if content-type is HTML
+        let data: any = null;
+        if (contentType.includes('application/json')) {
+          try {
+            data = await response.json();
+          } catch {
+            data = null;
+          }
+        }
+
+        // If response is successful and valid record object returned
+        if (response.ok && data && typeof data.text === 'string') {
+          if (isMounted) {
+            setRecord(data);
+            setLoading(false);
+          }
+          return;
+        }
+
+        // If record not found on server, check local history before showing error
+        const localRecord = checkLocalBackup();
+        if (localRecord && isMounted) {
+          setRecord(localRecord);
+          setLoading(false);
+          return;
+        }
+
+        // Server returned an error or non-JSON response
+        if (isMounted) {
+          const friendlyMessage =
+            data && typeof data.error === 'string'
+              ? data.error
+              : 'This QR code record does not exist or may have been deleted.';
+          setError(friendlyMessage);
+          setLoading(false);
+        }
+      } catch {
+        // Network or connection failure: check local backup
+        const localRecord = checkLocalBackup();
+        if (localRecord && isMounted) {
+          setRecord(localRecord);
+        } else if (isMounted) {
+          setError('This QR code record does not exist or may have been deleted.');
+        }
         if (isMounted) {
           setLoading(false);
         }

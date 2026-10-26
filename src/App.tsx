@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import QRCode from 'qrcode';
 import {
   QrCode,
@@ -12,7 +12,6 @@ import {
   Clock,
   History,
   Eye,
-  RotateCcw,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { QrHistoryItem, QrRecord } from './types';
@@ -29,6 +28,9 @@ export default function App() {
   const [qrSvgString, setQrSvgString] = useState<string>('');
   const [linkCopied, setLinkCopied] = useState<boolean>(false);
 
+  // Server-detected public origin (from Cloud Run APP_URL or Vercel environment)
+  const [serverPublicOrigin, setServerPublicOrigin] = useState<string>('');
+
   // History state
   const [history, setHistory] = useState<QrHistoryItem[]>(() => {
     try {
@@ -39,46 +41,94 @@ export default function App() {
     }
   });
 
-  // Sync history from server on mount
+  // Determine base public origin: Prioritize genuine public domain over localhost
+  const getPublicOrigin = useCallback((): string => {
+    // 1. If currently accessed on a real public domain in the browser (e.g. Vercel, Cloud Run, custom domain)
+    const hostname = window.location.hostname;
+    const isLocalhost =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '0.0.0.0' ||
+      hostname.endsWith('.local');
+
+    if (!isLocalhost && window.location.origin.startsWith('http')) {
+      return window.location.origin.replace(/\/+$/, '');
+    }
+
+    // 2. If server provided a genuine public origin (e.g. from APP_URL or Vercel)
+    if (serverPublicOrigin && serverPublicOrigin.startsWith('http')) {
+      return serverPublicOrigin.replace(/\/+$/, '');
+    }
+
+    // 3. If VITE_PUBLIC_URL environment variable is provided
+    const envUrl = import.meta.env.VITE_PUBLIC_URL;
+    if (envUrl && typeof envUrl === 'string' && envUrl.startsWith('http')) {
+      return envUrl.replace(/\/+$/, '');
+    }
+
+    // 4. Fallback to current window.location.origin
+    return window.location.origin;
+  }, [serverPublicOrigin]);
+
+  // Fetch server config and sync history from server on mount
   useEffect(() => {
-    async function syncServerHistory() {
+    async function initServerData() {
+      // 1. Fetch server config to obtain genuine public URL
       try {
-        const res = await fetch('/api/records');
-        if (res.ok) {
-          const data = await res.json();
-          if (Array.isArray(data.records) && data.records.length > 0) {
-            // Merge with local history
-            setHistory((prev) => {
-              const existingIds = new Set(prev.map((item) => item.id));
-              const newItems: QrHistoryItem[] = [];
-
-              for (const r of data.records) {
-                if (!existingIds.has(r.id)) {
-                  newItems.push({
-                    id: r.id,
-                    text: r.text,
-                    createdAt: r.createdAt,
-                    url: `${window.location.origin}/view/${r.id}`,
-                  });
-                }
-              }
-
-              if (newItems.length > 0) {
-                const merged = [...newItems, ...prev];
-                localStorage.setItem('quickqr_history', JSON.stringify(merged));
-                return merged;
-              }
-              return prev;
-            });
+        const configRes = await fetch('/api/config');
+        if (configRes.ok) {
+          const configContentType = configRes.headers.get('content-type') || '';
+          if (configContentType.includes('application/json')) {
+            const configData = await configRes.json();
+            if (configData.publicOrigin && typeof configData.publicOrigin === 'string') {
+              setServerPublicOrigin(configData.publicOrigin);
+            }
           }
         }
       } catch (err) {
-        console.error('Failed to sync history from server:', err);
+        console.warn('Could not fetch server config:', err);
+      }
+
+      // 2. Sync records from server
+      try {
+        const res = await fetch('/api/records');
+        if (res.ok) {
+          const contentType = res.headers.get('content-type') || '';
+          if (contentType.includes('application/json')) {
+            const data = await res.json();
+            if (Array.isArray(data.records) && data.records.length > 0) {
+              setHistory((prev) => {
+                const existingIds = new Set(prev.map((item) => item.id));
+                const newItems: QrHistoryItem[] = [];
+
+                for (const r of data.records) {
+                  if (!existingIds.has(r.id)) {
+                    newItems.push({
+                      id: r.id,
+                      text: r.text,
+                      createdAt: r.createdAt,
+                      url: `${getPublicOrigin()}/view/${r.id}`,
+                    });
+                  }
+                }
+
+                if (newItems.length > 0) {
+                  const merged = [...newItems, ...prev];
+                  localStorage.setItem('quickqr_history', JSON.stringify(merged));
+                  return merged;
+                }
+                return prev;
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to sync history from server:', err);
       }
     }
 
-    syncServerHistory();
-  }, []);
+    initServerData();
+  }, [getPublicOrigin]);
 
   // Save history to localStorage
   const updateHistory = (newHistory: QrHistoryItem[]) => {
@@ -88,16 +138,6 @@ export default function App() {
     } catch (e) {
       console.error('Failed to save to localStorage:', e);
     }
-  };
-
-  // Helper to determine base public origin
-  const getPublicOrigin = (): string => {
-    // If VITE_PUBLIC_URL is configured, prefer it, otherwise use current window origin
-    const envUrl = import.meta.env.VITE_PUBLIC_URL;
-    if (envUrl && typeof envUrl === 'string' && envUrl.startsWith('http')) {
-      return envUrl.replace(/\/+$/, '');
-    }
-    return window.location.origin;
   };
 
   const handleGenerate = async () => {
@@ -113,6 +153,7 @@ export default function App() {
       // 1. Save text record to backend
       let recordId = '';
       let createdAt = new Date().toISOString();
+      let trackingUrl = '';
 
       try {
         const response = await fetch('/api/records', {
@@ -121,12 +162,19 @@ export default function App() {
           body: JSON.stringify({ text }),
         });
 
-        if (response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (response.ok && contentType.includes('application/json')) {
           const data = await response.json();
           recordId = data.id;
-          createdAt = data.createdAt;
+          createdAt = data.createdAt || createdAt;
+          if (data.publicUrl && typeof data.publicUrl === 'string' && data.publicUrl.startsWith('http')) {
+            // If the server provided a public URL, verify it's not localhost
+            if (!data.publicUrl.includes('localhost') && !data.publicUrl.includes('127.0.0.1')) {
+              trackingUrl = data.publicUrl;
+            }
+          }
         } else {
-          throw new Error('Server returned ' + response.status);
+          throw new Error('Server returned invalid response');
         }
       } catch (backendErr) {
         console.warn('Backend save fallback to local generation:', backendErr);
@@ -134,9 +182,11 @@ export default function App() {
         recordId = Math.random().toString(36).substring(2, 10);
       }
 
-      // 2. Generate the dedicated scanning target URL
-      const baseOrigin = getPublicOrigin();
-      const trackingUrl = `${baseOrigin}/view/${recordId}`;
+      // 2. Generate the dedicated scanning target URL (Guaranteed non-localhost in production)
+      if (!trackingUrl) {
+        const baseOrigin = getPublicOrigin();
+        trackingUrl = `${baseOrigin}/view/${recordId}`;
+      }
 
       // 3. Generate crisp high-resolution PNG (1024x1024) of the dedicated URL
       const pngUrl = await QRCode.toDataURL(trackingUrl, {
@@ -232,7 +282,7 @@ export default function App() {
   const handleDeleteItem = async (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     try {
-      await fetch(`/api/records/${id}`, { method: 'DELETE' });
+      await fetch(`/api/records/${encodeURIComponent(id)}`, { method: 'DELETE' });
     } catch (err) {
       console.warn('Backend delete error:', err);
     }
